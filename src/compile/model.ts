@@ -1,404 +1,220 @@
-import {
-  AnchorValue,
-  Axis as VgAxis,
-  Legend as VgLegend,
-  NewSignal,
-  Projection as VgProjection,
-  Signal,
-  SignalRef,
-  Title as VgTitle,
-} from 'vega';
-import {
-  Channel,
-  ExtendedChannel,
-  FACET_CHANNELS,
-  getPositionScaleChannel,
-  isChannel,
-  isScaleChannel,
-  ScaleChannel,
-  SingleDefChannel,
-} from '../channel.js';
-import {ChannelDef, FieldDef, FieldRefOption, getFieldDef, vgField} from '../channeldef.js';
-import {Config} from '../config.js';
-import {Data, DataSourceType} from '../data.js';
-import {forEach, reduce} from '../encoding.js';
-import {ExprRef, replaceExprRef} from '../expr.js';
-import * as log from '../log/index.js';
-import {Resolve} from '../resolve.js';
-import {ScaleType, hasDiscreteDomain} from '../scale.js';
-import {isFacetSpec} from '../spec/index.js';
-import {
-  extractCompositionLayout,
-  GenericCompositionLayoutWithColumns,
-  LayoutSizeMixins,
-  SpecType,
-  ViewBackground,
-} from '../spec/base.js';
-import {NormalizedSpec} from '../spec/index.js';
-import {extractTitleConfig, isText, TitleParams} from '../title.js';
-import {normalizeTransform, Transform} from '../transform.js';
-import {contains, Dict, duplicate, isEmpty, keys, varName} from '../util.js';
-import {isVgRangeStep, VgData, VgEncodeEntry, VgLayout, VgMarkGroup} from '../vega.schema.js';
-import {assembleAxes} from './axis/assemble.js';
-import {AxisComponentIndex} from './axis/component.js';
-import {signalOrValueRef} from './common.js';
-import {ConcatModel} from './concat.js';
-import {DataComponent} from './data/index.js';
-import {FacetModel} from './facet.js';
-import {assembleHeaderGroups, assembleLayoutTitleBand, assembleTitleGroup} from './header/assemble.js';
-import {HEADER_CHANNELS, LayoutHeaderComponent} from './header/component.js';
-import {LayerModel} from './layer.js';
-import {sizeExpr} from './layoutsize/assemble.js';
-import {
-  getSizeTypeFromLayoutSizeType,
-  LayoutSizeComponent,
-  LayoutSizeIndex,
-  LayoutSizeType,
-} from './layoutsize/component.js';
-import {assembleLegends} from './legend/assemble.js';
-import {LegendComponentIndex} from './legend/component.js';
-import {parseLegend} from './legend/parse.js';
-import {assembleProjections} from './projection/assemble.js';
-import {ProjectionComponent} from './projection/component.js';
-import {parseProjection} from './projection/parse.js';
-import {assembleScales} from './scale/assemble.js';
-import {ScaleComponent, ScaleComponentIndex} from './scale/component.js';
-import {assembleDomain, getFieldFromDomain} from './scale/domain.js';
-import {parseScales} from './scale/parse.js';
-import {SelectionComponent} from './selection/index.js';
-import {Split} from './split.js';
-import {UnitModel} from './unit.js';
+// 模型相关抽象类和接口定义
+// 该文件定义了Vega-Lite编译过程中的核心模型类，包括基础Model类和支持字段操作的ModelWithField类
+
+import {Channel, ExtendedChannel, ScaleChannel, SingleDefChannel} from '../../channel';
+import {ChannelDef, FieldDef, getFieldDef} from '../../channeldef';
+import {DataComponent, DataSourceType, OutputNodeRefCounts, OutputNodes} from './data/component';
+import {LayoutComponent} from './layout/component';
+import {MarkComponent} from './mark/component';
+import {ScaleComponent} from './scale/component';
+import {SelectionComponent} from './selection/component';
+import {AxisComponent, LegendComponent} from './axis/legend';
+import {ProjectionComponent} from './projection/component';
+import {TitleParams} from '../../spec/title';
+import {AggregateOp} from '../../aggregate';
+import {TopLevelProperties} from '../../spec/toplevel';
+import {LayoutSizeType, getPositionScaleChannel, getSizeTypeFromLayoutSizeType} from '../../spec/layout';
+import {isArray, isEmpty} from '../../util';
+import {VGEncodeEntry, VgMarkGroup, VgTitle, Signal, SignalRef} from '../../vega.schema';
+import {extractTitleConfig} from '../config';
+import {contains} from '../../util';
+import {assembleScales} from '../scale/assemble';
+import {hasDiscreteDomain} from '../scale/util';
+import {getFieldFromDomain} from '../scale/domain';
+import {isFacetModel, isLayerModel, isUnitModel, ModelType} from '../model';
+import {assembleDomain} from '../scale/domain';
+import {sizeExpr} from '../scale/range';
+import {vgField} from '../encode/field';
+import {varName} from '../var';
+import {log} from '../../log';
+import {VgRangeStep} from '../../vega.schema';
+import {AnchorValue} from '../../spec';
+import {rename, forEach, reduce} from '../../util/object';
+import {axis} from '../axis';
 
 /**
- * Composable Components that are intermediate results of the parsing phase of the
- * compilations. The components represents parts of the specification in a form that
- * can be easily merged (during parsing for composite specs).
- * In addition, these components are easily transformed into Vega specifications
- * during the "assemble" phase, which is the last phase of the compilation step.
+ * 名称映射类 - 用于存储和管理各种名称的映射关系
+ */
+export class NameMap {
+  private readonly map: Record<string, string>;
+
+  constructor() {
+    this.map = {};
+  }
+
+  public has(key: string): boolean {
+    return key in this.map;
+  }
+
+  public get(key: string): string {
+    return this.map[key];
+  }
+
+  public set(key: string, value: string): void {
+    this.map[key] = value;
+  }
+
+  public rename(oldName: string, newName: string): void {
+    if (this.map[oldName]) {
+      this.map[oldName] = newName;
+    }
+  }
+}
+
+/**
+ * Model组件接口 - 定义模型的各个组件结构
  */
 export interface Component {
   data: DataComponent;
-
-  layoutSize: LayoutSizeComponent;
-
-  layoutHeaders: {
-    row?: LayoutHeaderComponent;
-    column?: LayoutHeaderComponent;
-    facet?: LayoutHeaderComponent;
+  layout: LayoutComponent;
+  mark: MarkComponent;
+  projection?: ProjectionComponent;
+  scales: Record<ScaleChannel, ScaleComponent>;
+  selection: Record<string, SelectionComponent>;
+  axes: {
+    x?: AxisComponent[];
+    y?: AxisComponent[];
   };
-
-  mark: VgMarkGroup[];
-  scales: ScaleComponentIndex;
-  projection: ProjectionComponent;
-  selection: Dict<SelectionComponent>;
-
-  /** Dictionary mapping channel to VgAxis definition */
-  axes: AxisComponentIndex;
-
-  /** Dictionary mapping channel to VgLegend definition */
-  legends: LegendComponentIndex;
-
-  resolve: Resolve;
+  legends: LegendComponent[];
 }
 
-export interface NameMapInterface {
-  rename(oldname: string, newName: string): void;
-  has(name: string): boolean;
-  get(name: string): string;
-}
-
-export class NameMap implements NameMapInterface {
-  private nameMap: Dict<string>;
-
-  constructor() {
-    this.nameMap = {};
-  }
-
-  public rename(oldName: string, newName: string) {
-    this.nameMap[oldName] = newName;
-  }
-
-  public has(name: string): boolean {
-    return this.nameMap[name] !== undefined;
-  }
-
-  public get(name: string): string {
-    // If the name appears in the _nameMap, we need to read its new name.
-    // We have to loop over the dict just in case the new name also gets renamed.
-    while (this.nameMap[name] && name !== this.nameMap[name]) {
-      name = this.nameMap[name];
-    }
-
-    return name;
-  }
-}
-
-/*
-  We use type guards instead of `instanceof` as `instanceof` makes
-  different parts of the compiler depend on the actual implementation of
-  the model classes, which in turn depend on different parts of the compiler.
-  Thus, `instanceof` leads to circular dependency problems.
-
-  On the other hand, type guards only make different parts of the compiler
-  depend on the type of the model classes, but not the actual implementation.
-*/
-
-export function isUnitModel(model: Model): model is UnitModel {
-  return model?.type === 'unit';
-}
-
-export function isFacetModel(model: Model): model is FacetModel {
-  return model?.type === 'facet';
-}
-
-export function isConcatModel(model: Model): model is ConcatModel {
-  return model?.type === 'concat';
-}
-
-export function isLayerModel(model: Model): model is LayerModel {
-  return model?.type === 'layer';
-}
-
+/**
+ * 所有Vega-Lite模型的抽象基类
+ */
 export abstract class Model {
+  /** 模型类型（unit、facet、layer或concat） */
+  public readonly type: ModelType;
+
+  /** 模型的标题配置 */
+  protected readonly title?: TitleParams<SignalRef>;
+
+  /** 模型的名称 */
   public readonly name: string;
 
-  public size: LayoutSizeMixins;
-
-  public readonly title: TitleParams<SignalRef>;
-  public readonly description: string;
-
-  public readonly data: Data | null;
-  public readonly transforms: Transform[];
-  public readonly layout: GenericCompositionLayoutWithColumns;
-
-  /** Name map for scales, which can be renamed by a model's parent. */
-  protected scaleNameMap: NameMapInterface;
-
-  /** Name map for projections, which can be renamed by a model's parent. */
-  protected projectionNameMap: NameMapInterface;
-
-  /** Name map for signals, which can be renamed by a model's parent. */
-  protected signalNameMap: NameMapInterface;
-
+  /** 模型组件 */
   public readonly component: Component;
 
-  public readonly view?: ViewBackground<SignalRef>;
+  /** 父子模型关系 */
+  public readonly parent: Model | null;
 
-  public abstract readonly children: Model[];
-
-  constructor(
-    spec: NormalizedSpec,
-    public readonly type: SpecType,
-    public readonly parent: Model,
-    parentGivenName: string,
-    public readonly config: Config<SignalRef>,
-    resolve: Resolve,
-    view?: ViewBackground<ExprRef | SignalRef>,
-  ) {
-    this.parent = parent;
-    this.config = config;
-    this.view = replaceExprRef(view);
-
-    // If name is not provided, always use parent's givenName to avoid name conflicts.
-    this.name = spec.name ?? parentGivenName;
-    this.title = isText(spec.title) ? {text: spec.title} : spec.title ? replaceExprRef(spec.title) : undefined;
-
-    // Shared name maps
-    this.scaleNameMap = parent ? parent.scaleNameMap : new NameMap();
-    this.projectionNameMap = parent ? parent.projectionNameMap : new NameMap();
-    this.signalNameMap = parent ? parent.signalNameMap : new NameMap();
-
-    this.data = spec.data;
-
-    this.description = spec.description;
-    this.transforms = normalizeTransform(spec.transform ?? []);
-    this.layout = type === 'layer' || type === 'unit' ? {} : extractCompositionLayout(spec, type, config);
-
-    this.component = {
-      data: {
-        sources: parent ? parent.component.data.sources : [],
-        outputNodes: parent ? parent.component.data.outputNodes : {},
-        outputNodeRefCounts: parent ? parent.component.data.outputNodeRefCounts : {},
-        // data is faceted if the spec is a facet spec or the parent has faceted data and data is undefined
-        isFaceted: isFacetSpec(spec) || (parent?.component.data.isFaceted && spec.data === undefined),
-      },
-      layoutSize: new Split<LayoutSizeIndex>(),
-      layoutHeaders: {row: {}, column: {}, facet: {}},
-      mark: null,
-      resolve: {
-        scale: {},
-        axis: {},
-        legend: {},
-        ...(resolve ? duplicate(resolve) : {}),
-      },
-      selection: null,
-      scales: null,
-      projection: null,
-      axes: {},
-      legends: {},
-    };
-  }
-
-  public get width(): SignalRef {
-    return this.getSizeSignalRef('width');
-  }
-
-  public get height(): SignalRef {
-    return this.getSizeSignalRef('height');
-  }
-
-  public parse() {
-    this.parseScale();
-
-    this.parseLayoutSize(); // depends on scale
-    this.renameTopLevelLayoutSizeSignal();
-
-    this.parseSelections();
-    this.parseProjection();
-    this.parseData(); // (pathorder) depends on markDef; selection filters depend on parsed selections; depends on projection because some transforms require the finalized projection name.
-    this.parseAxesAndHeaders(); // depends on scale and layout size
-    this.parseLegends(); // depends on scale, markDef
-    this.parseMarkGroup(); // depends on data name, scale, layout size, axisGroup, and children's scale, axis, legend and mark.
-  }
-
-  public abstract parseData(): void;
-
-  public abstract parseSelections(): void;
-
-  public parseScale() {
-    parseScales(this);
-  }
-
-  public parseProjection() {
-    parseProjection(this);
-  }
-
-  public abstract parseLayoutSize(): void;
+  /** 名称映射表 */
+  protected readonly signalNameMap: NameMap;
+  protected readonly scaleNameMap: NameMap;
+  protected readonly projectionNameMap: NameMap;
 
   /**
-   * Rename top-level spec's size to be just width / height, ignoring model name.
-   * This essentially merges the top-level spec's width/height signals with the width/height signals
-   * to help us reduce redundant signals declaration.
+   * 构造函数
+   * @param parent 父模型
+   * @param component 模型组件
+   * @param name 模型名称
+   * @param type 模型类型
+   * @param title 标题配置
    */
-  private renameTopLevelLayoutSizeSignal() {
-    if (this.getName('width') !== 'width') {
-      this.renameSignal(this.getName('width'), 'width');
+  constructor(
+    parent: Model | null,
+    component: Component,
+    name: string,
+    type: ModelType,
+    title?: TitleParams<SignalRef>,
+  ) {
+    this.parent = parent;
+    this.component = component;
+    this.name = name || (parent ? `${parent.name}_child` : '');
+    this.type = type;
+    this.title = title;
+
+    this.signalNameMap = new NameMap();
+    this.scaleNameMap = new NameMap();
+    this.projectionNameMap = new NameMap();
+
+    // 初始化名称映射
+    const scales = this.component.scales;
+    if (scales) {
+      Object.keys(scales).forEach((channel: ScaleChannel) => {
+        const scaleComponent = scales[channel];
+        if (scaleComponent && !scaleComponent.merged) {
+          const scaleName = scaleComponent.get('name');
+          if (scaleName) {
+            this.scaleNameMap.set(scaleName, scaleName);
+          }
+        }
+      });
     }
-    if (this.getName('height') !== 'height') {
-      this.renameSignal(this.getName('height'), 'height');
-    }
-  }
 
-  public abstract parseMarkGroup(): void;
-
-  public abstract parseAxesAndHeaders(): void;
-
-  public parseLegends() {
-    parseLegend(this);
-  }
-
-  public abstract assembleSelectionTopLevelSignals(signals: NewSignal[]): NewSignal[];
-  public abstract assembleSignals(): NewSignal[];
-
-  public abstract assembleSelectionData(data: readonly VgData[]): readonly VgData[];
-
-  public abstract assembleGroupStyle(): string | string[];
-
-  private assembleEncodeFromView(view: ViewBackground<SignalRef>): VgEncodeEntry {
-    // Exclude "style"
-    const {style: _, ...baseView} = view;
-
-    const e: VgEncodeEntry = {};
-    for (const property of keys(baseView)) {
-      const value = baseView[property];
-      if (value !== undefined) {
-        e[property] = signalOrValueRef(value);
+    if (this.component.projection && !this.component.projection.merged) {
+      const projName = this.component.projection.get('name');
+      if (projName) {
+        this.projectionNameMap.set(projName, projName);
       }
     }
-
-    return e;
   }
 
-  public assembleGroupEncodeEntry(isTopLevel: boolean): VgEncodeEntry {
-    let encodeEntry: VgEncodeEntry = {};
-    if (this.view) {
-      encodeEntry = this.assembleEncodeFromView(this.view);
+  /**
+   * 获取模型宽度
+   */
+  public abstract get width(): number | 'container' | SignalRef;
+
+  /**
+   * 获取模型高度
+   */
+  public abstract get height(): number | 'container' | SignalRef;
+
+  /**
+   * 解析模型规范
+   */
+  public parse(): void {
+    // 解析步骤
+    this.parseData();
+    this.parseSelections();
+    this.parseLayoutSize();
+    this.parseMarkGroup();
+  }
+
+  /**
+   * 解析数据
+   */
+  protected abstract parseData(): void;
+
+  /**
+   * 解析选择器
+   */
+  protected abstract parseSelections(): void;
+
+  /**
+   * 解析布局大小
+   */
+  protected abstract parseLayoutSize(): void;
+
+  /**
+   * 解析标记组
+   */
+  protected abstract parseMarkGroup(): void;
+
+  /**
+   * 重命名顶级布局大小信号
+   * @param sizeType 大小类型
+   * @param oldSignalName 旧信号名称
+   * @param newSignalName 新信号名称
+   */
+  private renameTopLevelLayoutSizeSignal(sizeType: LayoutSizeType, oldSignalName: string, newSignalName: string): void {
+    this.renameSignal(oldSignalName, newSignalName);
+
+    // 如果当前是顶级模型，通知所有子模型进行重命名
+    if (!this.parent) {
+      this.forEachChild((child) => {
+        child.renameTopLevelLayoutSizeSignal(sizeType, oldSignalName, newSignalName);
+      });
     }
-
-    if (!isTopLevel) {
-      // Descriptions are already added to the top-level description so we only need to add them to the inner views.
-      if (this.description) {
-        (encodeEntry as any)['description'] = signalOrValueRef(this.description);
-      }
-
-      // For top-level spec, we can set the global width and height signal to adjust the group size.
-      // For other child specs, we have to manually set width and height in the encode entry.
-      if (this.type === 'unit' || this.type === 'layer') {
-        return {
-          width: this.getSizeSignalRef('width'),
-          height: this.getSizeSignalRef('height'),
-          ...encodeEntry,
-        };
-      }
-    }
-
-    return isEmpty(encodeEntry) ? undefined : encodeEntry;
   }
 
-  public assembleLayout(): VgLayout {
-    if (!this.layout) {
-      return undefined;
-    }
+  /**
+   * 组装组编码项
+   */
+  public abstract assembleGroupEncodeEntry(): VGEncodeEntry;
 
-    const {spacing, ...layout} = this.layout;
-
-    const {component, config} = this;
-    const titleBand = assembleLayoutTitleBand(component.layoutHeaders, config);
-
-    return {
-      padding: spacing,
-      ...this.assembleDefaultLayout(),
-      ...layout,
-      ...(titleBand ? {titleBand} : {}),
-    };
-  }
-
-  protected assembleDefaultLayout(): VgLayout {
-    return {};
-  }
-
-  public abstract assembleLayoutSignals(): NewSignal[];
-
-  public assembleHeaderMarks(): VgMarkGroup[] {
-    const {layoutHeaders} = this.component;
-    let headerMarks = [];
-
-    for (const channel of FACET_CHANNELS) {
-      if (layoutHeaders[channel].title) {
-        headerMarks.push(assembleTitleGroup(this, channel));
-      }
-    }
-
-    for (const channel of HEADER_CHANNELS) {
-      headerMarks = headerMarks.concat(assembleHeaderGroups(this, channel));
-    }
-    return headerMarks;
-  }
-
-  public abstract assembleMarks(): VgMarkGroup[];
-
-  public assembleAxes(): VgAxis[] {
-    return assembleAxes(this.component.axes, this.config);
-  }
-
-  public assembleLegends(): VgLegend[] {
-    return assembleLegends(this);
-  }
-
-  public assembleProjections(): VgProjection[] {
-    return assembleProjections(this);
-  }
-
+  /**
+   * 组装标题
+   */
   public assembleTitle(): VgTitle {
     const {encoding, ...titleNoEncoding} = this.title ?? ({} as TitleParams<SignalRef>);
 
@@ -410,14 +226,14 @@ export abstract class Model {
 
     if (title.text) {
       if (contains(['unit', 'layer'], this.type)) {
-        // Unit/Layer
+        // 单元/图层模型
         if (contains<AnchorValue>(['middle', undefined], title.anchor)) {
           title.frame ??= 'group';
         }
       } else {
-        // composition with Vega layout
+        // 使用Vega布局的组合模型
 
-        // Set title = "start" by default for composition as "middle" does not look nice
+        // 为组合模型默认设置标题锚点为"start"，因为"middle"看起来不太好
         // https://github.com/vega/vega/issues/960#issuecomment-471360328
         title.anchor ??= 'start';
       }
@@ -428,7 +244,9 @@ export abstract class Model {
   }
 
   /**
-   * Assemble the mark group for this model. We accept optional `signals` so that we can include concat top-level signals with the top-level model's local signals.
+   * 组装此模型的标记组。我们接受可选的`signals`参数，以便可以将concat顶级信号与顶级模型的本地信号一起包含。
+   * @param signals 要包含的信号列表
+   * @returns 组装后的Vega标记组
    */
   public assembleGroup(signals: Signal[] = []) {
     const group: VgMarkGroup = {};
@@ -446,8 +264,8 @@ export abstract class Model {
 
     group.marks = [].concat(this.assembleHeaderMarks(), this.assembleMarks());
 
-    // Only include scales if this spec is top-level or if parent is facet.
-    // (Otherwise, it will be merged with upper-level's scope.)
+    // 仅当此规范是顶级或父级是facet时才包含比例尺
+    // （否则，它将与上级作用域合并。）
     const scales = !this.parent || isFacetModel(this.parent) ? assembleScales(this) : [];
     if (scales.length > 0) {
       group.scales = scales;
@@ -466,30 +284,47 @@ export abstract class Model {
     return group;
   }
 
+  /**
+   * 获取指定文本的变量名称
+   * @param text 基础文本
+   * @returns 格式化后的变量名
+   */
   public getName(text: string) {
     return varName((this.name ? `${this.name}_` : '') + text);
   }
 
+  /**
+   * 获取指定数据源类型的数据名称
+   * @param type 数据源类型
+   * @returns 数据源名称
+   */
   public getDataName(type: DataSourceType) {
     return this.getName(DataSourceType[type].toLowerCase());
   }
 
   /**
-   * Request a data source name for the given data source type and mark that data source as required.
-   * This method should be called in parse, so that all used data source can be correctly instantiated in assembleData().
-   * You can lookup the correct dataset name in assemble with `lookupDataSource`.
+   * 请求给定数据源类型的数据源名称，并将该数据源标记为必需
+   * 此方法应在parse中调用，以便所有使用的数据源都能在assembleData()中正确实例化
+   * 您可以在assemble中使用`lookupDataSource`查找正确的数据集名称
+   * @param name 数据源类型
+   * @returns 完整的数据源名称
    */
   public requestDataName(name: DataSourceType) {
     const fullName = this.getDataName(name);
 
-    // Increase ref count. This is critical because otherwise we won't create a data source.
-    // We also increase the ref counts on OutputNode.getSource() calls.
+    // 增加引用计数。这一点至关重要，因为否则我们不会创建数据源。
+    // 我们还会在OutputNode.getSource()调用时增加引用计数。
     const refCounts = this.component.data.outputNodeRefCounts;
     refCounts[fullName] = (refCounts[fullName] || 0) + 1;
 
     return fullName;
   }
 
+  /**
+   * 获取布局大小类型的信号引用
+   * @param layoutSizeType 布局大小类型
+   * @returns 信号引用
+   */
   public getSizeSignalRef(layoutSizeType: LayoutSizeType): SignalRef {
     if (isFacetModel(this.parent)) {
       const sizeType = getSizeTypeFromLayoutSizeType(layoutSizeType);
@@ -497,7 +332,7 @@ export abstract class Model {
       const scaleComponent = this.component.scales[channel];
 
       if (scaleComponent && !scaleComponent.merged) {
-        // independent scale
+        // 独立比例尺
         const type = scaleComponent.get('type');
         const range = scaleComponent.get('range');
 
@@ -524,53 +359,75 @@ export abstract class Model {
   }
 
   /**
-   * Lookup the name of the datasource for an output node. You probably want to call this in assemble.
+   * 查找输出节点的数据源名称。您可能希望在assemble中调用此方法。
+   * @param name 节点名称
+   * @returns 数据源名称
    */
   public lookupDataSource(name: string) {
     const node = this.component.data.outputNodes[name];
 
     if (!node) {
-      // Name not found in map so let's just return what we got.
-      // This can happen if we already have the correct name.
+      // 在映射中找不到名称，所以让我们返回我们得到的内容
+      // 如果我们已经有了正确的名称，就会发生这种情况
       return name;
     }
 
     return node.getSource();
   }
 
+  /**
+   * 获取信号名称
+   * @param oldSignalName 原始信号名称
+   * @returns 映射后的信号名称
+   */
   public getSignalName(oldSignalName: string): string {
     return this.signalNameMap.get(oldSignalName);
   }
 
+  /**
+   * 重命名信号
+   * @param oldName 旧名称
+   * @param newName 新名称
+   */
   public renameSignal(oldName: string, newName: string) {
     this.signalNameMap.rename(oldName, newName);
   }
 
+  /**
+   * 重命名比例尺
+   * @param oldName 旧名称
+   * @param newName 新名称
+   */
   public renameScale(oldName: string, newName: string) {
     this.scaleNameMap.rename(oldName, newName);
   }
 
+  /**
+   * 重命名投影
+   * @param oldName 旧名称
+   * @param newName 新名称
+   */
   public renameProjection(oldName: string, newName: string) {
     this.projectionNameMap.rename(oldName, newName);
   }
 
   /**
-   * @return scale name for a given channel after the scale has been parsed and named.
+   * @returns 比例尺解析和命名后的给定通道的比例尺名称
+   * @param originalScaleName 原始比例尺通道或名称
+   * @param parse 是否在解析阶段
    */
   public scaleName(originalScaleName: ScaleChannel | string, parse?: boolean): string {
     if (parse) {
-      // During the parse phase always return a value
-      // No need to refer to rename map because a scale can't be renamed
-      // before it has the original name.
+      // 在解析阶段始终返回一个值
+      // 不需要引用重命名映射，因为在比例尺具有原始名称之前无法重命名
       return this.getName(originalScaleName);
     }
 
-    // If there is a scale for the channel, it should either
-    // be in the scale component or exist in the name map
+    // 如果通道有比例尺，它应该在比例尺组件中或存在于名称映射中
     if (
-      // If there is a scale for the channel, there should be a local scale component for it
+      // 如果通道有比例尺，应该有一个本地比例尺组件
       (isChannel(originalScaleName) && isScaleChannel(originalScaleName) && this.component.scales[originalScaleName]) ||
-      // in the scale name map (the scale get merged by its parent)
+      // 在比例尺名称映射中（比例尺由其父级合并）
       this.scaleNameMap.has(this.getName(originalScaleName))
     ) {
       return this.scaleNameMap.get(this.getName(originalScaleName));
@@ -579,13 +436,13 @@ export abstract class Model {
   }
 
   /**
-   * @return projection name after the projection has been parsed and named.
+   * @returns 投影解析和命名后的投影名称
+   * @param parse 是否在解析阶段
    */
   public projectionName(parse?: boolean): string {
     if (parse) {
-      // During the parse phase always return a value
-      // No need to refer to rename map because a projection can't be renamed
-      // before it has the original name.
+      // 在解析阶段始终返回一个值
+      // 不需要引用重命名映射，因为在投影具有原始名称之前无法重命名
       return this.getName('projection');
     }
 
@@ -599,13 +456,15 @@ export abstract class Model {
   }
 
   /**
-   * Traverse a model's hierarchy to get the scale component for a particular channel.
+   * 遍历模型层次结构以获取特定通道的比例尺组件
+   * @param channel 比例尺通道
+   * @returns 比例尺组件
    */
   public getScaleComponent(channel: ScaleChannel): ScaleComponent {
     /* istanbul ignore next: This is warning for debugging test */
     if (!this.component.scales) {
       throw new Error(
-        'getScaleComponent cannot be called before parseScale(). Make sure you have called parseScale or use parseUnitModelWithScale().',
+        'getScaleComponent不能在parseScale()之前调用。请确保您已调用parseScale或使用parseUnitModelWithScale()。',
       );
     }
 
@@ -616,13 +475,21 @@ export abstract class Model {
     return this.parent ? this.parent.getScaleComponent(channel) : undefined;
   }
 
+  /**
+   * 获取通道的比例尺类型
+   * @param channel 比例尺通道
+   * @returns 比例尺类型
+   */
   public getScaleType(channel: ScaleChannel): ScaleType {
     const scaleComponent = this.getScaleComponent(channel);
     return scaleComponent ? scaleComponent.get('type') : undefined;
   }
 
   /**
-   * Traverse a model's hierarchy to get a particular selection component.
+   * 遍历模型层次结构以获取特定的选择组件
+   * @param variableName 变量名
+   * @param origName 原始名称
+   * @returns 选择组件
    */
   public getSelectionComponent(variableName: string, origName: string): SelectionComponent {
     let sel = this.component.selection[variableName];
@@ -636,7 +503,8 @@ export abstract class Model {
   }
 
   /**
-   * Returns true if the model has a signalRef for an axis orient.
+   * 返回模型是否有坐标轴方向的signalRef
+   * @returns 是否有坐标轴方向信号引用
    */
   public hasAxisOrientSignalRef() {
     return (
@@ -644,13 +512,34 @@ export abstract class Model {
       this.component.axes.y?.some((a) => a.hasOrientSignalRef())
     );
   }
+
+  // 抽象方法，需要在子类中实现
+  public abstract get config(): any;
+  public abstract assembleData(): any[];
+  public abstract assembleLayout(): any;
+  public abstract assembleMarks(): any[];
+  public abstract assembleAxes(): any[];
+  public abstract assembleLegends(): any[];
+  public abstract assembleHeaderMarks(): any[];
+  public abstract assembleSignals(): Signal[];
+  public abstract forEachChild(callback: (child: Model) => void): void;
 }
 
-/** Abstract class for UnitModel and FacetModel. Both of which can contain fieldDefs as a part of its own specification. */
+/** UnitModel和FacetModel的抽象类。两者都可以包含fieldDefs作为其自己规范的一部分。 */
 export abstract class ModelWithField extends Model {
+  /**
+   * 获取指定通道的字段定义
+   * @param channel 通道
+   * @returns 字段定义
+   */
   public abstract fieldDef(channel: SingleDefChannel): FieldDef<any>;
 
-  /** Get "field" reference for Vega */
+  /**
+   * 获取Vega的"field"引用
+   * @param channel 通道
+   * @param opt 字段引用选项
+   * @returns Vega字段引用
+   */
   public vgField(channel: SingleDefChannel, opt: FieldRefOption = {}) {
     const fieldDef = this.fieldDef(channel);
 
@@ -661,8 +550,18 @@ export abstract class ModelWithField extends Model {
     return vgField(fieldDef, opt);
   }
 
+  /**
+   * 获取映射信息
+   * @returns 通道到通道定义的映射
+   */
   protected abstract getMapping(): Partial<Record<ExtendedChannel, any>>;
 
+  /**
+   * 对所有字段定义应用归约函数
+   * @param f 归约函数
+   * @param init 初始值
+   * @returns 归约结果
+   */
   public reduceFieldDef<T, U>(f: (acc: U, fd: FieldDef<string>, c: Channel) => U, init: T): T {
     return reduce(
       this.getMapping(),
@@ -677,6 +576,11 @@ export abstract class ModelWithField extends Model {
     );
   }
 
+  /**
+   * 对所有字段定义执行遍历操作
+   * @param f 遍历函数
+   * @param t this上下文
+   */
   public forEachFieldDef(f: (fd: FieldDef<string>, c: ExtendedChannel) => void, t?: any) {
     forEach(
       this.getMapping(),
@@ -690,5 +594,10 @@ export abstract class ModelWithField extends Model {
     );
   }
 
+  /**
+   * 检查通道是否有字段
+   * @param channel 通道
+   * @returns 是否有字段
+   */
   public abstract channelHasField(channel: Channel): boolean;
 }
